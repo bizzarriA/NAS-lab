@@ -203,6 +203,30 @@ class Oracle:
         i, v = max(self.history, key=lambda t: t[1])
         return self.df["ops"].iat[i], float(v)
 
+class LatencyCheckOracle(Oracle):
+    # Oracle whose latency constraint is checked after the architecture has been picked
+
+    def __init__(self, df, budget, lat_max, seed=0):
+        super().__init__(df, budget, seed=seed)
+        self.lat = df["lat"].to_numpy()
+        self.lat_max = lat_max
+        self.measured_lat = {}
+        self.n_rejected = 0
+
+    def query(self, idx):
+        idx = int(idx)
+        if idx in self.cache:
+            return self.cache[idx]
+        if self.remaining() <= 0:
+            raise BudgetExhausted()
+        self.measured_lat[idx] = self.lat[idx]
+        if self.lat[idx] > self.lat_max:
+            # Measured but not trained: costs one query, no training time
+            self.history.append((idx, 0.0))
+            self.cache[idx] = None
+            self.n_rejected += 1
+            return None
+        return super().query(idx)
 
 # -----------------------------------------------------------------------------
 # Bayesian optimization: surrogate model
@@ -214,7 +238,6 @@ def make_gp(seed=0):
               + WhiteKernel(1e-2, (1e-6, 1e1)))
     return GaussianProcessRegressor(kernel=kernel, normalize_y=True,
                                     n_restarts_optimizer=0, random_state=seed)
-
 
 # -----------------------------------------------------------------------------
 # Plotting
