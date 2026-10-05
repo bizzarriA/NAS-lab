@@ -47,7 +47,33 @@ def _as_ops(arch):
 # -----------------------------------------------------------------------------
 # Data loading
 # -----------------------------------------------------------------------------
-def load_benchmark(path, dataset="cifar10", device="edgegpu", verbose=True):
+def load_benchmark(path, dataset="cifar10", verbose=True):
+    """Load the CSV (local path or URL) and return a tidy DataFrame.
+
+    One row per architecture, with standard column names:
+      arch_str, op_e1_0 ... op_e3_2, ops (tuple of 6 ops),
+      acc (validation accuracy, used during the search), test_acc, cost (training time)
+    """
+    assert dataset in DATASETS, f"dataset must be one of {DATASETS}"
+    raw = pd.read_csv(path)
+
+    def col(name):
+        c = f"{dataset}_{name}"
+        return raw[c].astype(float) if c in raw.columns else pd.Series(np.nan, index=raw.index)
+
+    df = raw[["arch_str"] + OP_COLS].copy()
+    df["ops"] = [tuple(r) for r in df[OP_COLS].itertuples(index=False)]
+    df["acc"] = col("valid_acc")
+    df["test_acc"] = col("test_acc")
+    df["cost"] = col("train_time")
+    df = df.dropna(subset=["acc"]).drop_duplicates("arch_str").reset_index(drop=True)
+
+    if verbose:
+        print(f"Loaded {len(df)} architectures | dataset = {dataset} ")
+    return df
+
+
+def load_HW_benchmark(path, dataset="cifar10", device="edgegpu", verbose=True):
     """Load the CSV (local path or URL) and return a tidy DataFrame.
 
     One row per architecture, with standard column names:
