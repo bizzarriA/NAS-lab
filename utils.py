@@ -143,26 +143,33 @@ def draw_cell(arch, ax=None, title=None, show=True):
 class BudgetExhausted(Exception):
     pass
 
+def base_objective_function(arch):
+    """Default objective: the validation accuracy of an architecture (a row of df)."""
+    return arch["acc"]
+
 
 class Oracle:
     """Tabular-benchmark estimation strategy with a query budget.
 
-    oracle.query(idx)       -> accuracy of the architecture in row `idx`
+    oracle.query(idx)       -> objective of the architecture in row `idx`
     oracle.query_ops(ops)   -> same, given a tuple of 6 ops (or an arch string)
     oracle.remaining()      -> queries still available
     oracle.n_queries        -> queries used so far
-    oracle.best()           -> (ops, accuracy) of the best architecture found
-    oracle.incumbent_curve()-> best accuracy found after each query
+    oracle.best()           -> (ops, objective) of the best architecture found
+    oracle.incumbent_curve()-> best objective found after each query
+    oracle.queried()        -> row indices of the queried architectures, in query order
+    oracle.incumbent_idx()  -> row index of the best architecture after each query
     oracle.sim_cost         -> simulated training time spent (seconds)
 
+    The objective is `objective_fn(row)`, where `row` is a row of `df`
+    (e.g. row["acc"], row["lat"], row["energy"]). By default it is row[metric].
     Re-querying an architecture is free (results are cached).
-    With noise_std > 0 the returned accuracy is noisy (low-fidelity estimate);
-    history and curves always record the TRUE accuracy.
+    With noise_std > 0 the returned value is noisy (low-fidelity estimate);
+    history and curves always record the TRUE value.
     """
 
-    def __init__(self, df, budget, metric="acc", noise_std=0.0, seed=0):
+    def __init__(self, df, budget, metric="acc", noise_std=0.0, seed=0, objective_fn=None):
         self.df, self.budget = df, budget
-        self.true_vals = df[metric].to_numpy()
         self.costs = df["cost"].to_numpy() if "cost" in df else np.zeros(len(df))
         self.arch2idx = {ops: i for i, ops in enumerate(df["ops"])}
         self.noise_std = noise_std
@@ -170,6 +177,7 @@ class Oracle:
         self.history = []          # list of (idx, true value)
         self.cache = {}
         self.sim_cost = 0.0
+        self.objective_fn = objective_fn if objective_fn is not None else (lambda row: row[metric])
 
     @property
     def n_queries(self):
@@ -184,7 +192,7 @@ class Oracle:
             return self.cache[idx]
         if self.remaining() <= 0:
             raise BudgetExhausted()
-        true = self.true_vals[idx]
+        true = float(self.objective_fn(self.df.iloc[idx]))
         obs = true + (self.rng.normal(0, self.noise_std) if self.noise_std > 0 else 0.0)
         self.history.append((idx, true))
         self.cache[idx] = obs
@@ -199,9 +207,26 @@ class Oracle:
         vals = np.array([v for _, v in self.history])
         return np.maximum.accumulate(vals) if len(vals) else vals
 
+    def queried(self):
+        return np.array([i for i, _ in self.history], dtype=int)
+
+    def incumbent_idx(self):
+        best_i, best_v, out = None, -np.inf, []
+        for i, v in self.history:
+            if v > best_v:
+                best_i, best_v = i, v
+            out.append(best_i)
+        return np.array(out, dtype=int)
+
     def best(self):
         i, v = max(self.history, key=lambda t: t[1])
         return self.df["ops"].iat[i], float(v)
+
+
+def evaluate_objective(df, objective_fn, idx=None):
+    """Objective of every architecture of df (or only of the rows `idx`), as a numpy array."""
+    sub = df if idx is None else df.iloc[idx]
+    return np.array([objective_fn(row) for _, row in sub.iterrows()], dtype=float)
 
 class LatencyCheckOracle(Oracle):
     # Oracle whose latency constraint is checked after the architecture has been picked
@@ -242,10 +267,12 @@ def make_gp(seed=0):
 # -----------------------------------------------------------------------------
 # Plotting
 # -----------------------------------------------------------------------------
-def plot_regret(results, title="Regret vs number of evaluations"):
-    """results: dict name -> array (n_runs x budget) of regret curves."""
+def plot_regret(results, title="Regret vs number of evaluations", ylabel="Regret (% points)"):
+    """results: dict name -> array (n_runs x budget) of regret curves
+    (or a (curves, oracles) tuple, as returned by run_many)."""
     plt.figure(figsize=(9, 5))
-    for name, R in results.items():
+    for name, out in results.items():
+        R, _ = out if isinstance(out, tuple) else (out, None)
         R = np.atleast_2d(R)
         x = np.arange(1, R.shape[1] + 1)
         m = R.mean(0)
@@ -254,5 +281,50 @@ def plot_regret(results, title="Regret vs number of evaluations"):
             se = R.std(0) / np.sqrt(len(R))
             plt.fill_between(x, m - se, m + se, alpha=0.2)
     plt.yscale("symlog", linthresh=0.1)
-    plt.xlabel("# evaluated architectures"); plt.ylabel("Regret (% points)")
+    plt.xlabel("# evaluated architectures"); plt.ylabel(ylabel)
     plt.title(title); plt.legend(); plt.grid(alpha=0.3); plt.show()
+
+
+def plot_search(oracles, df, lat_max=None, device=None, title=None):
+    """Compare searches in the accuracy/latency plane.
+
+    oracles: dict name -> Oracle (or list of Oracles, one per seed: the first is
+             used for the scatter, all of them for the curves).
+    Left:   accuracy vs latency of all architectures, of those evaluated by each
+            method and of the best one found (star), with the Pareto front.
+    Center: latency of the incumbent (best by objective so far) vs iterations.
+    Right:  accuracy of the incumbent vs iterations.
+    """
+    acc, lat = df["acc"].to_numpy(), df["lat"].to_numpy()
+    fig, ax = plt.subplots(1, 3, figsize=(17, 4.5))
+    ax[0].scatter(lat, acc, s=2, alpha=0.15, color="lightgray", label="all")
+    order = np.argsort(lat)
+    pf = order[np.maximum.accumulate(acc[order]) == acc[order]]
+    pf = pf[np.r_[True, np.diff(acc[pf]) > 0]]
+    ax[0].plot(lat[pf], acc[pf], "k.-", lw=1, ms=3, label="Pareto front")
+    for k, (name, os_) in enumerate(oracles.items()):
+        os_ = os_ if isinstance(os_, (list, tuple)) else [os_]
+        color = f"C{k}"
+        q = os_[0].queried()
+        ax[0].scatter(lat[q], acc[q], s=12, alpha=0.6, color=color, label=name)
+        b = os_[0].incumbent_idx()[-1]
+        ax[0].scatter(lat[b], acc[b], s=250, marker="*", color=color, edgecolor="k", zorder=5)
+        inc = np.array([o.incumbent_idx() for o in os_])     # n_runs x n_queries
+        x = np.arange(1, inc.shape[1] + 1)
+        for a, vals in ((ax[1], lat[inc]), (ax[2], acc[inc])):
+            m = vals.mean(0)
+            a.plot(x, m, color=color, lw=2, label=name)
+            if len(vals) > 1:
+                se = vals.std(0) / np.sqrt(len(vals))
+                a.fill_between(x, m - se, m + se, color=color, alpha=0.2)
+    if lat_max is not None:
+        for a in (ax[0], ax[1]):
+            (a.axvline if a is ax[0] else a.axhline)(lat_max, color="r", ls="--", lw=1, label="LAT_MAX")
+    unit = f"Latency on {device} (ms)" if device else "Latency (ms)"
+    ax[0].set(xlabel=unit, ylabel="Accuracy (%)", title="Evaluated architectures (★ = best found)")
+    ax[1].set(xlabel="# evaluated architectures", ylabel=unit, title="Latency of the best architecture so far")
+    ax[2].set(xlabel="# evaluated architectures", ylabel="Accuracy (%)", title="Accuracy of the best architecture so far")
+    ax[0].legend(fontsize=8, markerscale=1.5); ax[1].legend(fontsize=8)
+    if title:
+        fig.suptitle(title)
+    plt.tight_layout(); plt.show()
